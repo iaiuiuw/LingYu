@@ -250,3 +250,6 @@ class WeChatService:
         return await self.send_file(
             recipient, file_path, dry_run=dry_run, confirm=confirm
         )
+
+    async def download_file_attachment(self, token: str) -> dict[str, Any]:
+        return await self._adapter.download_file_attachment(token)

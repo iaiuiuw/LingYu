@@ -11,6 +11,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -1144,6 +1145,9 @@ class WeChatMessage:
     voice_path: str = ""        # 已提取到本地的语音文件（供 ASR 使用）
     # lingyu 新增：已提取到本地的图片文件（供视觉模型识别）。
     image_path: str = ""
+    file_token: str = ""    # 普通文件的短期按需下载凭证
+    file_name: str = ""     # 普通文件名（不触发下载）
+    file_size: int = 0         # 普通文件大小（仅元数据，不触发下载）
     voice_url: str = ""         # 远端语音附件地址（QQ）
     voice_mime: str = ""        # 语音附件 MIME
     voice_filename: str = ""    # 远端语音附件文件名
@@ -1331,6 +1335,9 @@ class WeChatBridge:
         self._listen_started_at = 0.0
         # 已跳过多少条历史消息（只用于汇总日志，不参与业务判断）。
         self._history_skipped = 0
+        self._file_attachments: dict[str, dict[str, object]] = {}
+        self._file_attachments_lock = threading.Lock()
+        self._file_attachment_ttl = 3600.0
 
     @property
     def status(self) -> ConnectionStatus:
@@ -2184,6 +2191,12 @@ class WeChatBridge:
             image_path = ""
             if message_type == "image":
                 image_path = self._extract_image_file(msg, chat_id)
+            file_token = ""
+            file_name = ""
+            if message_type in {"file", "49", "attachment"} or content == self.CARD_CONTENT_PLACEHOLDER:
+                file_token, file_name, file_size = self._register_file_attachment(msg, chat_id, raw_content)
+            else:
+                file_size = 0
 
             # lingyu 新增：解析引用/回复的目标显示名。
             reply_to_name = self._extract_reply_target(raw_content)
@@ -2214,6 +2227,9 @@ class WeChatBridge:
                 poke_sender=poke_sender,
                 voice_path=voice_path,
                 image_path=image_path,
+                file_token=file_token,
+                file_name=file_name,
+                file_size=file_size,
                 reply_to_name=reply_to_name,
             )
 
@@ -2329,6 +2345,75 @@ class WeChatBridge:
         except Exception as exc:
             logger.warning(f"[微信] 提取图片文件失败: {exc}")
         return ""
+
+    def _register_file_attachment(self, msg, chat_id: str, raw_content: str) -> tuple[str, str, int]:
+        """登记普通文件元数据；只有消费 token 时才从微信数据库复制文件。"""
+        if self._backend != "wechatauto":
+            return "", "", 0
+        ctx = self._resolve_media_context(msg, chat_id)
+        if ctx is None:
+            return "", "", 0
+        local_id, db, user = ctx
+        file_name = ""
+        try:
+            from wechatauto.media import MediaDownloader
+
+            row = db.get_message_row(user, local_id, local_type=49)
+            if row:
+                file_name = str(MediaDownloader(db)._file_name(row) or "")
+        except Exception as exc:
+            logger.debug(f"[微信] 文件元数据读取失败: {exc}")
+        if not file_name:
+            match = re.search(r"<title>([^<]+)</title>", raw_content or "", re.I)
+            file_name = match.group(1).strip() if match else ""
+        file_size = self._file_size(db, file_name) if file_name else 0
+        token = secrets.token_urlsafe(24)
+        now = time.time()
+        with self._file_attachments_lock:
+            cutoff = now - self._file_attachment_ttl
+            self._file_attachments = {
+                key: value for key, value in self._file_attachments.items()
+                if float(value.get("created_at", 0)) >= cutoff
+            }
+            self._file_attachments[token] = {
+                "db": db, "user": user, "local_id": local_id,
+                "file_name": file_name, "created_at": now,
+                "file_size": file_size,
+            }
+        return token, file_name, file_size
+
+    @staticmethod
+    def _file_size(db, file_name: str) -> int:
+        """读取微信文件现有落盘大小；不复制文件，也不触发下载。"""
+        if not file_name:
+            return 0
+        try:
+            base = os.path.join(str(db.account_dir), "msg", "file")
+            for root, _, files in os.walk(base):
+                if file_name in files:
+                    try:
+                        return max(0, int(os.path.getsize(os.path.join(root, file_name))))
+                    except OSError:
+                        return 0
+        except (OSError, TypeError, ValueError):
+            return 0
+        return 0
+
+    def download_file_attachment(self, token: str) -> str:
+        """按 token 下载一个已登记的普通文件，返回本地路径。"""
+        token = str(token or "").strip()
+        with self._file_attachments_lock:
+            item = self._file_attachments.get(token)
+        if not item or time.time() - float(item.get("created_at", 0)) > self._file_attachment_ttl:
+            return ""
+        if self._backend != "wechatauto":
+            return ""
+        from wechatauto.media import MediaDownloader
+
+        save_dir = os.path.join(tempfile.gettempdir(), "lingyu", "files")
+        return str(MediaDownloader(item["db"], save_dir=save_dir).download_file(
+            str(item["user"]), int(item["local_id"]), save_dir=save_dir
+        ) or "")
 
     @staticmethod
     def _identity_key(value: str) -> str:

@@ -17,6 +17,18 @@ from .config import BotConfig, default_config_path
 from .llm import LLMError
 
 
+def _format_file_size(size: int) -> str:
+    size = int(size or 0)
+    if size <= 0:
+        return "未知"
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return "未知"
+
+
 class _AppServerConnection:
     def __init__(self, command: str, workspace: Path, sandbox: str, debug):
         self.command = command
@@ -282,7 +294,32 @@ class _AppServerConnection:
                         "input": self._input(prompt, image_path),
                     })
                 else:
-                    state = await self._start_turn(thread_id, prompt, image_path)
+                    try:
+                        state = await self._start_turn(thread_id, prompt, image_path)
+                    except Exception as exc:
+                        if "active writer" not in str(exc).lower():
+                            raise
+                        # App Server may still be running a turn whose completion
+                        # notification this connection did not observe (for example,
+                        # after reconnect). Adopt that turn and steer the new message
+                        # instead of repeatedly failing turn/start.
+                        response = await self.request("thread/resume", {
+                            "threadId": thread_id, "cwd": str(self.workspace),
+                            "initialTurnsPage": {"limit": 20, "sortDirection": "desc"},
+                        })
+                        turns = ((response.get("initialTurnsPage") or {}).get("data") or [])
+                        active = next((turn for turn in turns if turn.get("status") == "inProgress"), None)
+                        if active is None:
+                            raise
+                        state = {
+                            "turn_id": active["id"], "status": "inProgress",
+                            "done": asyncio.Event(), "text": self._turn_text(active), "error": "",
+                        }
+                        self._turns[thread_id] = state
+                        await self.request("turn/steer", {
+                            "threadId": thread_id, "expectedTurnId": active["id"],
+                            "input": self._input(prompt, image_path),
+                        })
         await state["done"].wait()
         if state["status"] != "completed":
             raise RuntimeError(state.get("error") or f"turn {state['status']}")
@@ -410,6 +447,9 @@ class CodexAgentClient:
         prompt = f"[wx:{kind}] {chat_name}|{sender}\n{content}"
         if kwargs.get("voice_path"):
             prompt += f"\n[v:{kwargs['voice_path']}]"
+        if kwargs.get("file_token"):
+            name = str(kwargs.get("file_name") or "文件")
+            prompt += f"\n[f:{name}|大小:{_format_file_size(kwargs.get('file_size', 0))}|{kwargs['file_token']}]"
         if config.agent_reply_transport == "http":
             prompt += "\n[r:Http]"
         else:
@@ -478,6 +518,8 @@ class CodexAgentClient:
         prompt = f"[wx:{kind}] {record.chat}|{record.sender}\n{record.content}"
         if record.voice_path:
             prompt += f"\n[v:{record.voice_path}]"
+        if getattr(record, "file_token", ""):
+            prompt += f"\n[f:{record.file_name or '文件'}|大小:{_format_file_size(getattr(record, 'file_size', 0))}|{record.file_token}]"
         if self._config.agent_reply_transport == "http":
             prompt += "\n[r:Http]"
         else:

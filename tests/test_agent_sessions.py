@@ -5,11 +5,25 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
-from lingyu.bot.agent import CodexAgentClient, _AppServerConnection
+from lingyu.bot.agent import CodexAgentClient, _AppServerConnection, _format_file_size
 from lingyu.bot.config import BotConfig
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    def test_file_size_formatting(self):
+        self.assertEqual(_format_file_size(0), "未知")
+        self.assertEqual(_format_file_size(18 * 1024 * 1024 + 600 * 1024), "18.6MB")
+
+    async def test_prompt_includes_file_size_metadata(self):
+        config = BotConfig(agent_reply_transport="http")
+        prompt, _ = CodexAgentClient._prompt(
+            config,
+            {"chat_name": "私聊", "sender": "Alice", "file_name": "a.xlsx",
+             "file_size": 2048, "file_token": "token"},
+            [{"role": "user", "content": "文件"}],
+        )
+        self.assertIn("[f:a.xlsx|大小:2.0KB|token]", prompt)
+
     async def test_prompt_uses_compact_channel_and_metadata_markers(self):
         config = BotConfig(agent_reply_transport="http")
         prompt, image = CodexAgentClient._prompt(
@@ -100,6 +114,44 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((thread_id, reply), ("new-thread", "reply"))
         self.assertEqual([method for method, _ in requests], ["thread/start", "turn/start"])
+
+    async def test_active_writer_conflict_adopts_and_steers_existing_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            connection = _AppServerConnection("codex", Path(tmp), "read-only", lambda _: None)
+            connection.start = AsyncMock()
+            resume_count = 0
+
+            async def request(method, params):
+                nonlocal resume_count
+                if method == "thread/resume":
+                    resume_count += 1
+                    turns = [] if resume_count == 1 else [{
+                        "id": "existing-turn", "status": "inProgress",
+                        "items": [{"type": "agentMessage", "text": "partial"}],
+                    }]
+                    return {"initialTurnsPage": {"data": turns}}
+                if method == "turn/start":
+                    raise RuntimeError("thread already has an active writer")
+                if method == "turn/steer":
+                    asyncio.get_running_loop().call_soon(asyncio.create_task, complete_turn())
+                    return {}
+                raise AssertionError(method)
+
+            async def complete_turn():
+                await asyncio.sleep(0)
+                await connection._notification({
+                    "method": "turn/completed",
+                    "params": {"threadId": "thread", "turn": {
+                        "id": "existing-turn", "status": "completed",
+                        "items": [{"type": "agentMessage", "text": "recovered reply"}],
+                    }},
+                })
+
+            connection.request = request
+            result = await connection.run("thread", "new message")
+
+        self.assertEqual(result, "recovered reply")
+        self.assertEqual(resume_count, 2)
 
     async def test_stale_pid_cleanup_only_terminates_owned_app_server(self):
         with tempfile.TemporaryDirectory() as tmp:

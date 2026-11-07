@@ -350,6 +350,10 @@ class DesktopApi:
         self._ready = threading.Event()
         self.bridge: GuiBridge | None = None
         self.bridge_url = ""
+        self._webhook_server = None
+        self._webhook_thread: threading.Thread | None = None
+        self._webhook_service = None
+        self._webhook_watchdog_task: asyncio.Task | None = None
 
     def _call(self, coro: Any, timeout: float = DEFAULT_TIMEOUT) -> Any:
         self._ready.wait(timeout=timeout)
@@ -397,28 +401,83 @@ class DesktopApi:
             self.engine.log("warning", f"gui-bridge.json 写入失败: {e}")
         print(f"LingYu GUI bridge: {self.bridge_url}")
         # 纯触发 HTTP 模式必须先启动 Webhook，再接收微信事件。
-        if self.config.webhook_enabled or (
-            self.config.agent_enabled
-            and self.config.agent_self_reply
-            and self.config.agent_reply_transport == "http"
-        ):
-            from .webhook import start_webhook
-            try:
-                # 创建临时的 WeChatService 用于 webhook
-                from .service import WeChatService
-                svc = WeChatService(adapter=self.adapter)
-                self._webhook_server, self._webhook_thread = start_webhook(
-                    svc,
-                    self.config.webhook_port,
-                    self.config.webhook_token or None,
-                    loop=self._hub.loop,
-                )
-                self.config.webhook_token = getattr(self._webhook_server, "webhook_token", self.config.webhook_token)
-                print(f"Webhook 已启动: http://127.0.0.1:{self.config.webhook_port}/webhook")
-            except Exception as e:
-                print(f"Webhook 启动失败: {e}", file=sys.stderr)
+        await self._ensure_webhook_async()
+        self._webhook_watchdog_task = asyncio.create_task(self._webhook_watchdog())
         if self.config.enabled:
             await self.engine.start()
+
+    def _webhook_should_run(self) -> bool:
+        return bool(
+            self.config
+            and (
+                self.config.webhook_enabled
+                or (
+                    self.config.agent_enabled
+                    and self.config.agent_self_reply
+                    and self.config.agent_reply_transport == "http"
+                )
+            )
+        )
+
+    async def _ensure_webhook_async(self) -> bool:
+        if not self._webhook_should_run():
+            return False
+        if self._webhook_server is not None and self._webhook_thread is not None:
+            if self._webhook_thread.is_alive():
+                return True
+            self._close_webhook()
+        try:
+            from .service import WeChatService
+            from .webhook import start_webhook
+
+            self._webhook_service = WeChatService(adapter=self.adapter)
+            self._webhook_server, self._webhook_thread = start_webhook(
+                self._webhook_service,
+                self.config.webhook_port,
+                self.config.webhook_token or None,
+                loop=self._hub.loop,
+            )
+            self.config.webhook_token = getattr(
+                self._webhook_server, "webhook_token", self.config.webhook_token
+            )
+            self.engine.log(
+                "info", f"Webhook 已启动: http://127.0.0.1:{self.config.webhook_port}/webhook"
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - watchdog will retry
+            self._close_webhook()
+            self.engine.log("warning", f"Webhook 启动失败，将自动重试: {exc}")
+            return False
+
+    def _close_webhook(self) -> None:
+        server = self._webhook_server
+        self._webhook_server = None
+        self._webhook_thread = None
+        self._webhook_service = None
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:  # noqa: BLE001 - shutdown is best effort
+                pass
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001 - shutdown is best effort
+                pass
+
+    async def _webhook_watchdog(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(3)
+                if self._webhook_should_run():
+                    if not self._webhook_thread or not self._webhook_thread.is_alive():
+                        self.engine.log("warning", "Webhook 服务线程已退出，正在自动复活。")
+                        await self._ensure_webhook_async()
+                elif self._webhook_server is not None:
+                    self._close_webhook()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the watchdog alive
+                self.engine.log("warning", f"Webhook watchdog 异常，将继续重试: {exc}")
 
     def _bridge_call(self, path: str, payload: dict) -> Any:
         async def call() -> Any:
@@ -452,6 +511,13 @@ class DesktopApi:
         finally:
             self._ready.set()
 
+    async def _shutdown_async(self) -> None:
+        if self._webhook_watchdog_task is not None:
+            self._webhook_watchdog_task.cancel()
+            await asyncio.gather(self._webhook_watchdog_task, return_exceptions=True)
+            self._webhook_watchdog_task = None
+        self._close_webhook()
+
     # ------------------------------------------------------------------ 状态
 
     async def _get_state_async(self) -> dict:
@@ -466,6 +532,8 @@ class DesktopApi:
     # ------------------------------------------------------------------ 保存
 
     async def _save_config_async(self, new: BotConfig) -> dict:
+        old_webhook_port = self.config.webhook_port
+        old_webhook_token = self.config.webhook_token
         if new.enabled and not self.engine.running:
             await self.engine.start()
         elif not new.enabled and self.engine.running:
@@ -474,6 +542,17 @@ class DesktopApi:
         self.config.__dict__.update(new.to_dict())
         self._apply_send_dirs()
         self.config.save()
+        if (
+            old_webhook_port != self.config.webhook_port
+            or old_webhook_token != self.config.webhook_token
+        ):
+            self._close_webhook()
+        if self._webhook_watchdog_task is None or self._webhook_watchdog_task.done():
+            self._webhook_watchdog_task = asyncio.create_task(self._webhook_watchdog())
+        if self._webhook_should_run():
+            await self._ensure_webhook_async()
+        elif self._webhook_server is not None:
+            self._close_webhook()
         return await self._get_state_async()
 
     def _apply_send_dirs(self) -> None:
@@ -650,6 +729,11 @@ def run() -> None:
         )
         raise
     finally:
+        if api._ready.is_set():
+            try:
+                hub.call(api._shutdown_async(), timeout=10)
+            except Exception as exc:  # noqa: BLE001 - app is already exiting
+                print(f"Webhook 关闭失败: {exc}", file=sys.stderr)
         if api.bridge:
             api.bridge.stop()
             bridge_file = Path(os.environ.get("APPDATA", str(Path.home()))) / "lingyu" / "gui-bridge.json"

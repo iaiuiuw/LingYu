@@ -78,6 +78,9 @@ class MessageRecord:
     # 已提取到本地的图片文件路径；非图片消息为空串。
     image_path: str = ""
     voice_path: str = ""
+    file_token: str = ""
+    file_name: str = ""
+    file_size: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return _serialize(asdict(self))

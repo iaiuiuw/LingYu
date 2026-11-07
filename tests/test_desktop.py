@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import asyncio
 import sys
 import tempfile
 import time
@@ -202,13 +203,22 @@ class EngineLogForwardingTests(unittest.TestCase):
 
     def test_bootstrap_wires_on_log(self):
         """桌面壳启动时必须真的把 ``on_log`` 接上（这就是当初漏掉的那一步）。"""
-        import asyncio
-
         from lingyu.bot import BotConfig
 
         fake_engine = SimpleNamespace(start=mock.AsyncMock())
-        fake_adapter = SimpleNamespace(connect=mock.AsyncMock())
+        fake_adapter = SimpleNamespace(
+            connect=mock.AsyncMock(),
+            config=SimpleNamespace(allow_send_dirs=()),
+        )
         api = desktop.DesktopApi.__new__(desktop.DesktopApi)
+        api._hub = SimpleNamespace(loop=None)
+        api._ready = mock.Mock()
+        api.bridge = None
+        api.bridge_url = ""
+        api._webhook_server = None
+        api._webhook_thread = None
+        api._webhook_service = None
+        api._webhook_watchdog_task = None
 
         with mock.patch.object(
             desktop, "WeChatAdapter", lambda *a, **k: fake_adapter
@@ -218,10 +228,60 @@ class EngineLogForwardingTests(unittest.TestCase):
             desktop, "UI_LOG"
         ) as ui_log:
             cfg.load.return_value = BotConfig()
-            asyncio.run(desktop.DesktopApi._bootstrap_async(api))
+            async def bootstrap_and_shutdown():
+                api._hub.loop = asyncio.get_running_loop()
+                await desktop.DesktopApi._bootstrap_async(api)
+                await desktop.DesktopApi._shutdown_async(api)
+
+            asyncio.run(bootstrap_and_shutdown())
 
         self.assertIs(fake_engine.on_log, desktop.forward_engine_log)
         ui_log.attach.assert_called_once_with(fake_engine)
+
+
+class WebhookWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    def _api(self):
+        api = desktop.DesktopApi.__new__(desktop.DesktopApi)
+        api.config = SimpleNamespace(
+            webhook_enabled=False,
+            agent_enabled=True,
+            agent_self_reply=True,
+            agent_reply_transport="http",
+            webhook_port=18765,
+            webhook_token="",
+        )
+        api.engine = SimpleNamespace(log=mock.Mock())
+        api._webhook_server = None
+        api._webhook_thread = None
+        api._webhook_service = None
+        api._webhook_watchdog_task = None
+        return api
+
+    async def test_watchdog_restarts_after_server_thread_exits(self):
+        api = self._api()
+        api._webhook_server = object()
+        api._webhook_thread = SimpleNamespace(is_alive=lambda: False)
+        api._ensure_webhook_async = mock.AsyncMock(return_value=True)
+        with mock.patch.object(
+            desktop.asyncio,
+            "sleep",
+            side_effect=[None, asyncio.CancelledError()],
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await api._webhook_watchdog()
+        api._ensure_webhook_async.assert_awaited_once_with()
+        api.engine.log.assert_any_call("warning", "Webhook 服务线程已退出，正在自动复活。")
+
+    async def test_shutdown_cancels_watchdog_and_closes_server(self):
+        api = self._api()
+        server = mock.Mock()
+        api._webhook_server = server
+        api._webhook_thread = SimpleNamespace(is_alive=lambda: True)
+        api._webhook_watchdog_task = asyncio.create_task(asyncio.sleep(60))
+        await api._shutdown_async()
+        self.assertIsNone(api._webhook_watchdog_task)
+        server.shutdown.assert_called_once_with()
+        server.server_close.assert_called_once_with()
 
 
 class WebView2CheckTests(unittest.TestCase):

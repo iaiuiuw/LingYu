@@ -38,6 +38,18 @@ from .links import (
     supported_urls,
     usable_cookies_file,
 )
+
+
+def _format_file_size(size: int) -> str:
+    size = int(size or 0)
+    if size <= 0:
+        return "未知"
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return "未知"
 from .llm import LLMClient, LLMError
 from .agent import CodexAgentClient, close_agent_connections
 from .persona import get_persona
@@ -125,6 +137,9 @@ class HistoryItem:
     # 该条消息对应的本地图片路径（非图片为空串），供视觉模型识别。
     image_path: str = ""
     voice_path: str = ""
+    file_token: str = ""
+    file_name: str = ""
+    file_size: int = 0
 
 
 @dataclass
@@ -371,6 +386,9 @@ class BotEngine:
                 is_group=record.is_group,
                 image_path=record.image_path,
                 voice_path=record.voice_path,
+                file_token=record.file_token,
+                file_name=record.file_name,
+                file_size=record.file_size,
             )
         )
         # 记住最近一条入站消息，供主动参与挑选目标会话。
@@ -493,6 +511,9 @@ class BotEngine:
                     self._build_messages(chat_key), image_path=record.image_path,
                     chat_name=record.chat, sender=record.sender, is_group=record.is_group,
                     voice_path=record.voice_path,
+                    file_token=record.file_token,
+                    file_name=record.file_name,
+                    file_size=record.file_size,
                 )
             except LLMError as exc:
                 self._log("error", f"Codex 触发失败：{exc.message}")
@@ -578,6 +599,9 @@ class BotEngine:
                     messages, image_path=record.image_path, chat_name=record.chat,
                     sender=record.sender, is_group=record.is_group,
                     voice_path=record.voice_path,
+                    file_token=record.file_token,
+                    file_name=record.file_name,
+                    file_size=record.file_size,
                 )
             else:
                 reply = await client.chat(messages)
@@ -896,6 +920,8 @@ class BotEngine:
                 text = f"{prefix}{item.sender}: {item.content}"
             else:
                 text = f"{prefix}{item.content}"
+            if item.file_token:
+                text += f"\n[f:{item.file_name or '文件'}|大小:{_format_file_size(item.file_size)}|{item.file_token}]"
             # 已解析的链接信息附在该条消息后，模型据此回应链接内容。
             link_block = self._link_block(item)
             if link_block:

@@ -1075,7 +1075,22 @@ class WeChatAdapter:
             reply_to_name=str(getattr(message, "reply_to_name", "") or ""),
             image_path=str(getattr(message, "image_path", "") or ""),
             voice_path=str(getattr(message, "voice_path", "") or ""),
+            file_token=str(getattr(message, "file_token", "") or ""),
+            file_name=str(getattr(message, "file_name", "") or ""),
+            file_size=int(getattr(message, "file_size", 0) or 0),
         )
+
+    async def download_file_attachment(self, token: str) -> dict[str, Any]:
+        """按消息事件提供的短期 token 下载普通微信文件。"""
+        if self._bridge is None or not hasattr(self._bridge, "download_file_attachment"):
+            return {"ok": False, "error": {"code": "unsupported", "message": "当前微信后端不支持文件下载"}}
+        try:
+            path = await asyncio.to_thread(self._bridge.download_file_attachment, token)
+        except Exception as exc:
+            return {"ok": False, "error": {"code": "download_failed", "message": str(exc)}}
+        if not path:
+            return {"ok": False, "error": {"code": "file_unavailable", "message": "文件凭证无效、已过期或微信本地库中没有该文件"}}
+        return {"ok": True, "status": "downloaded", "file_path": path}
 
     def _snapshot(self) -> list[MessageRecord]:
         with self._buffer_lock:

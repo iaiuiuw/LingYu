@@ -60,6 +60,7 @@ class WebhookRequest:
         # 可选：语音参数
         self.voice_duration: int = data.get('voice_duration', 0)
         self.delay_seconds: float = data.get('delay_seconds', 0.0)
+        self.file_token: str = data.get('file_token', '')
 
     def validate(self) -> dict[str, Any] | None:
         """验证请求是否合法。"""
@@ -67,6 +68,7 @@ class WebhookRequest:
             'get_wechat_status', 'get_chat_list', 'get_chat_history',
             'search_contact', 'get_chat_info', 'get_recent_messages',
             'set_monitored_chats', 'send_message', 'send_file', 'send_voice',
+            'download_file',
         ):
             return {'ok': False, 'error': {'code': 'invalid_action', 'message': f'不支持的动作: {self.action}'}}
         needs_recipient = self.action in ('send_message', 'send_file', 'send_voice', 'get_chat_history', 'get_chat_info')
@@ -76,6 +78,8 @@ class WebhookRequest:
             return {'ok': False, 'error': {'code': 'missing_content', 'message': 'send_message 需要 content 字段'}}
         if self.action in ('send_file', 'send_voice') and not self.file_path:
             return {'ok': False, 'error': {'code': 'missing_file', 'message': f'{self.action} 需要 file_path 字段'}}
+        if self.action == 'download_file' and not self.file_token:
+            return {'ok': False, 'error': {'code': 'missing_file_token', 'message': 'download_file 需要 file_token 字段'}}
         fp = Path(self.file_path) if self.file_path else None
         if fp and not fp.is_file():
             return {'ok': False, 'error': {'code': 'file_not_found', 'message': f'文件不存在: {self.file_path}'}}
@@ -174,6 +178,8 @@ class _WebhookHandler(BaseHTTPRequestHandler):
             return await self._service.set_monitored_chats(
                 add=request.data.get('add'), remove=request.data.get('remove'), mode=request.data.get('mode')
             )
+        if request.action == 'download_file':
+            return await self._service.download_file_attachment(request.file_token)
         for attempt in range(1, 2):
             try:
                 if request.action == 'send_message':
